@@ -1,8 +1,17 @@
 package iap
 
 import (
+	"bytes"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
 	"log"
+	"net/http"
+	"strings"
 	"sync"
+	"time"
+
+	"github.com/google/uuid"
 )
 
 // Biller manages subscription business logic and state.
@@ -188,6 +197,99 @@ func (b *Biller) RefundTransaction(sub *Subscription, receiptInfo ReceiptInfo) e
 	}
 
 	return nil
+}
+
+// SendNotification fires an Apple S2S-style notification to webhookURL.
+// It builds a fake JWS (unsigned, dev-only) in Apple's App Store Server Notifications v2 format.
+// notificationType: SUBSCRIBED, DID_RENEW, DID_FAIL_TO_RENEW, EXPIRED, GRACE_PERIOD_EXPIRED,
+//
+//	CANCEL, REFUND, REVOKE, PRICE_INCREASE
+func (b *Biller) SendNotification(sub *Subscription, notificationType, webhookURL string) error {
+	if webhookURL == "" {
+		return fmt.Errorf("WEBHOOK_URL not configured")
+	}
+
+	b.mu.RLock()
+	latest := sub.LatestReceiptInfo()
+	b.mu.RUnlock()
+
+	if latest == nil {
+		return fmt.Errorf("subscription has no receipt info")
+	}
+
+	now := time.Now()
+	notificationUUID := uuid.New().String()
+
+	// Inner JWS payload: signedTransactionInfo (transaction details)
+	txPayload := map[string]interface{}{
+		"originalTransactionId": latest.OriginalTransactionID,
+		"transactionId":         latest.TransactionID,
+		"productId":             latest.ProductID,
+		"purchaseDate":          now.UnixMilli(),
+		"expiresDate":           latest.ExpiresDate.UnixMilli(),
+		"type":                  "Auto-Renewable Subscription",
+		"inAppOwnershipType":    "PURCHASED",
+	}
+	signedTransactionInfo := buildFakeJWS(txPayload)
+
+	// Inner JWS payload: signedRenewalInfo
+	renewalPayload := map[string]interface{}{
+		"originalTransactionId":   latest.OriginalTransactionID,
+		"productId":               latest.ProductID,
+		"autoRenewProductId":      latest.ProductID,
+		"autoRenewStatus":         1,
+		"signedDate":              now.UnixMilli(),
+	}
+	signedRenewalInfo := buildFakeJWS(renewalPayload)
+
+	// Outer notification envelope
+	notificationPayload := map[string]interface{}{
+		"notificationType": notificationType,
+		"notificationUUID": notificationUUID,
+		"version":          "2.0",
+		"signedDate":       now.UnixMilli(),
+		"data": map[string]interface{}{
+			"bundleId":              "com.example.app",
+			"bundleVersion":         "1",
+			"environment":           "Sandbox",
+			"signedTransactionInfo": signedTransactionInfo,
+			"signedRenewalInfo":     signedRenewalInfo,
+		},
+	}
+	outerJWS := buildFakeJWS(notificationPayload)
+
+	req, err := http.NewRequest(http.MethodPost, webhookURL, strings.NewReader(outerJWS))
+	if err != nil {
+		return fmt.Errorf("failed to build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to send notification: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("webhook returned %d", resp.StatusCode)
+	}
+
+	log.Printf("[notify] %s → %s (%s) → %d", notificationType, webhookURL, notificationUUID, resp.StatusCode)
+	return nil
+}
+
+// buildFakeJWS encodes payload as a fake JWS compact token (unsigned, dev-only).
+// Format: base64url(header) . base64url(payload) . fakesig
+func buildFakeJWS(payload interface{}) string {
+	header := base64.RawURLEncoding.EncodeToString(
+		[]byte(`{"alg":"ES256","x5c":["dev-mock"]}`),
+	)
+	payloadBytes, _ := json.Marshal(payload)
+	var buf bytes.Buffer
+	enc := base64.NewEncoder(base64.RawURLEncoding, &buf)
+	_, _ = enc.Write(payloadBytes)
+	enc.Close()
+	return header + "." + buf.String() + ".dev-mock-sig"
 }
 
 // ClearSubs removes all subscriptions.

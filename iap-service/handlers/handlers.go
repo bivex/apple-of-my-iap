@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"net/http"
+	"os"
 
 	"github.com/gin-gonic/gin"
 	iap "github.com/meetup/iap-api"
@@ -9,13 +10,15 @@ import (
 
 // Handlers contains the HTTP handlers for the IAP service.
 type Handlers struct {
-	biller *iap.Biller
+	biller     *iap.Biller
+	webhookURL string // backend URL to push S2S notifications to (WEBHOOK_URL env)
 }
 
 // New creates a new Handlers instance.
 func New(biller *iap.Biller) *Handlers {
 	return &Handlers{
-		biller: biller,
+		biller:     biller,
+		webhookURL: os.Getenv("WEBHOOK_URL"),
 	}
 }
 
@@ -30,6 +33,7 @@ func (h *Handlers) RegisterRoutes(r *gin.Engine) {
 	r.POST("/subs/:receiptToken/renew", h.renewSub)
 	r.POST("/subs/:receiptToken/cancel", h.cancelSub)
 	r.POST("/subs/:receiptToken/refund/:transactionId", h.refundTransaction)
+	r.POST("/subs/:receiptToken/notify/:notificationType", h.sendNotification)
 	r.POST("/verifyReceipt", h.verifyReceipt)
 }
 
@@ -217,4 +221,55 @@ func (h *Handlers) verifyReceipt(c *gin.Context) {
 
 	c.Header("Content-Type", "application/json")
 	c.String(http.StatusOK, response)
+}
+
+// validNotificationTypes is the set of Apple S2S v2 notification types the mock accepts.
+var validNotificationTypes = map[string]bool{
+	"SUBSCRIBED":             true,
+	"DID_RENEW":              true,
+	"DID_FAIL_TO_RENEW":      true,
+	"EXPIRED":                true,
+	"GRACE_PERIOD_EXPIRED":   true,
+	"CANCEL":                 true,
+	"REFUND":                 true,
+	"REVOKE":                 true,
+	"PRICE_INCREASE":         true,
+}
+
+// sendNotification fires an Apple S2S-style notification to the configured WEBHOOK_URL.
+// POST /subs/:receiptToken/notify/:notificationType
+func (h *Handlers) sendNotification(c *gin.Context) {
+	receiptToken := c.Param("receiptToken")
+	notificationType := c.Param("notificationType")
+
+	if !validNotificationTypes[notificationType] {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "unknown notificationType",
+			"valid": []string{"SUBSCRIBED", "DID_RENEW", "DID_FAIL_TO_RENEW", "EXPIRED",
+				"GRACE_PERIOD_EXPIRED", "CANCEL", "REFUND", "REVOKE", "PRICE_INCREASE"},
+		})
+		return
+	}
+
+	if h.webhookURL == "" {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "WEBHOOK_URL not configured"})
+		return
+	}
+
+	sub, ok := h.biller.GetSubscription(receiptToken)
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "subscription not found"})
+		return
+	}
+
+	if err := h.biller.SendNotification(sub, notificationType, h.webhookURL); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":           "sent",
+		"notificationType": notificationType,
+		"webhookURL":       h.webhookURL,
+	})
 }
