@@ -2,14 +2,254 @@
 
 ![build](https://github.com/meetup/apple-of-my-iap/workflows/build/badge.svg)
 
-Apple-of-My-IAP is an open sourced tool and library to help developers integrate subscription based Apple In-App Purchases into their backend. 
+> **Originally created by [Meetup](https://www.meetup.com)** - A huge thank you to the original authors for creating this valuable tool for the iOS developer community.
+>
+> **Go Migration (2026)** - This project has been refactored to Go for improved maintainability and performance, while preserving all original functionality.
 
-This project is made up of two separate sub-projects:
+Apple-of-My-IAP is an open sourced tool and library to help developers integrate subscription based Apple In-App Purchases into their backend.
 
-1. A mock service which simulates Apple's iTunes IAP service
-2. A scala client for interacting with both the iTunes Sandbox/Production service or the mock service
+This project provides mock services which simulate Apple's iTunes IAP service, available in both **Go** and **Scala** implementations.
+
+## Table of Contents
+
+- [Go Implementation](#go-implementation) ⭐ **Recommended**
+- [Legacy Scala Implementation](#legacy-scala-implementation) (moved to `legacy/`)
+- [Credits](#credits)
 
 To learn more about why this project exists, see this blog post: http://making.meetup.com/post/127718510507/apple-in-app-purchase-mock-service-fake-it-till
+
+---
+
+## Go Implementation
+
+The Go implementation is the recommended version for new deployments. It features:
+
+- **Modern stack**: Go 1.23+ with Gin framework
+- **Multi-module architecture**: Separate `iap-api` and `iap-service` modules
+- **API-only**: RESTful interface (no web UI)
+- **File-based caching**: Subscription data persisted to `tmp/` directory
+- **Graceful shutdown**: Proper signal handling for clean shutdowns
+
+### Quick Start
+
+```bash
+# Build
+go build -o bin/server ./cmd/server
+
+# Run (default: port 9090, cache dir ./tmp)
+./bin/server
+
+# With custom configuration
+PORT=8080 CACHE_DIR=/var/cache/iap GIN_MODE=debug ./bin/server
+```
+
+### Configuration
+
+| Environment Variable | Default | Description |
+|---------------------|---------|-------------|
+| `PORT` | `9090` | Server port |
+| `CACHE_DIR` | `./tmp` | Directory for subscription cache |
+| `GIN_MODE` | `release` | Gin mode: `debug` or `release` |
+
+### Project Structure
+
+```
+├── go.work              # Go workspace
+├── cmd/server/main.go   # Server entry point
+├── iap-api/             # API module (models, business logic)
+│   ├── status.go        # Apple IAP status codes
+│   ├── types.go         # Receipt types
+│   ├── plan.go          # Plan model
+│   ├── cache.go         # File persistence
+│   ├── subscription.go  # Subscription model
+│   ├── receipt_generator.go  # Mock receipt generation
+│   ├── receipt_renderer.go    # Apple JSON format
+│   └── biller.go        # Business logic
+└── iap-service/         # HTTP layer
+    └── handlers/handlers.go  # Gin HTTP handlers
+```
+
+### Setup Plans
+
+Create `tmp/plans.json` before starting:
+
+```json
+[
+  {
+    "name": "test",
+    "description": "test_plan",
+    "billInterval": 3,
+    "billIntervalUnit": "minutes",
+    "trialInterval": 0,
+    "trialIntervalUnit": "minutes",
+    "productId": "test_apple_plan"
+  },
+  {
+    "name": "monthly_unlimited",
+    "description": "Unlimited plan billed monthly",
+    "billInterval": 1,
+    "billIntervalUnit": "months",
+    "trialInterval": 0,
+    "trialIntervalUnit": "days",
+    "productId": "com.example.unlimited.1mo"
+  }
+]
+```
+
+### API Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/` | Service info |
+| GET | `/plans` | List all plans |
+| GET | `/subs` | List all subscriptions |
+| POST | `/subs` | Create subscription |
+| POST | `/subs/:token` | Set subscription status |
+| POST | `/subs/:token/renew` | Renew subscription |
+| POST | `/subs/:token/cancel` | Cancel subscription |
+| POST | `/subs/:token/refund/:transactionId` | Refund transaction |
+| POST | `/subs/clear` | Clear all subscriptions |
+| POST | `/verifyReceipt` | Verify receipt (Apple format) |
+
+### Usage Examples
+
+```bash
+# Create a subscription
+curl -X POST http://localhost:9090/subs \
+  -H "Content-Type: application/json" \
+  -d '{"productId":"com.example.unlimited.1mo"}'
+
+# Get all subscriptions
+curl http://localhost:9090/subs
+
+# Renew a subscription
+curl -X POST http://localhost:9090/subs/{receiptToken}/renew
+
+# Cancel a subscription
+curl -X POST http://localhost:9090/subs/{receiptToken}/cancel
+
+# Verify a receipt (Apple format)
+curl -X POST http://localhost:9090/verifyReceipt \
+  -H "Content-Type: application/json" \
+  -d '{"receipt-data":"your_receipt_token_here"}'
+
+# Clear all subscriptions
+curl -X POST http://localhost:9090/subs/clear
+```
+
+### Verify Receipt Response
+
+The `/verifyReceipt` endpoint returns responses in Apple's IAP format:
+
+```json
+{
+  "status": 0,
+  "latest_receipt_info": [
+    {
+      "quantity": "1",
+      "product_id": "com.example.unlimited.1mo",
+      "transaction_id": "com.example.unlimited.1mo-1234567890",
+      "original_transaction_id": "com.example.unlimited.1mo-1234567890",
+      "purchase_date": "2026-03-02 14:46:25",
+      "purchase_date_ms": "1740935185000",
+      "original_purchase_date": "2026-03-02 14:46:25",
+      "original_purchase_date_ms": "1740935185000",
+      "expires_date": "2026-04-02 14:46:25",
+      "expires_date_ms": "1743613585000",
+      "is_trial_period": "false"
+    }
+  ],
+  "latest_receipt": "monthly_unlimited_abc1-def2"
+}
+```
+
+### Status Codes
+
+The mock server supports all Apple IAP status codes:
+
+| Code | Name | Description |
+|------|------|-------------|
+| 0 | ValidReceipt | The receipt is valid |
+| 21002 | BadReceipt | Malformed or missing receipt-data |
+| 21003 | UnauthorizedReceipt | Receipt could not be authenticated |
+| 21004 | SharedSecretMismatch | Shared secret does not match |
+| 21005 | ServerUnavailable | Receipt server not available |
+| 21006 | SubscriptionExpired | Subscription has expired |
+| 21007 | TestToProduction | Receipt from test sent to production |
+| 21008 | ProductionToTest | Receipt from production sent to test |
+
+### Tests
+
+The Go implementation includes comprehensive test coverage:
+
+```bash
+# Run all tests
+go test ./...
+
+# Run tests for specific module
+go test ./iap-api/...
+go test ./iap-service/...
+
+# Run with verbose output
+go test ./... -v
+```
+
+**Test Coverage:**
+
+| Module | File | Tests | Description |
+|--------|------|-------|-------------|
+| iap-api | status_test.go | 2 | Status code lookup and validation |
+| iap-api | types_test.go | 7 | AppleTime marshaling, ReceiptInfo models |
+| iap-api | cache_test.go | 4 | File persistence for subscriptions and plans |
+| iap-api | subscription_test.go | 7 | Subscription lifecycle (create, renew, cancel, refund) |
+| iap-api | receipt_generator_test.go | 5 | Receipt token generation and date calculations |
+| iap-api | receipt_renderer_test.go | 5 | Apple JSON format rendering |
+| iap-api | biller_test.go | 11 | Business logic and persistence |
+| iap-service | handlers_test.go | 10 | HTTP endpoint handlers |
+
+**Total: 51 tests** covering all core functionality.
+
+---
+
+## Legacy Scala Implementation
+
+The original Scala implementation has been moved to the `legacy/` directory and is maintained for compatibility purposes. It includes a web UI built with AngularJS.
+
+### Running the Scala Version
+
+```bash
+cd legacy
+sbt
+project scala-service
+run
+```
+
+The Scala service will run on port 9090. See `legacy/README.md` for full documentation.
+
+---
+
+## Credits
+
+**Original Authors - Meetup Team**
+
+This project was originally created and maintained by the talented team at [Meetup](https://www.meetup.com). We want to express our sincere gratitude for their contribution to the iOS developer community.
+
+- **Original Repository**: [meetup/apple-of-my-iap](https://github.com/meetup/apple-of-my-iap)
+- **Blog Post**: [Apple In-App Purchase Mock Service - Fake It 'Till You Make It](http://making.meetup.com/post/127718510507/apple-in-app-purchase-mock-service-fake-it-till)
+
+**Go Migration (2026)**
+
+The Go implementation refactored the original Scala codebase while maintaining all functionality:
+- Modern stack with Go 1.23+ and Gin framework
+- Improved performance and reduced resource usage
+- Comprehensive test coverage (51 tests)
+- Cleaner separation of concerns with multi-module architecture
+
+---
+
+## Scala Implementation
+
+The Scala implementation is maintained for legacy compatibility. It includes a web UI built with AngularJS.
 
 Mock Service
 ------------
